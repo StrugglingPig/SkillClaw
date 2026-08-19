@@ -446,6 +446,19 @@ def doctor_claude():
     _echo_report(report)
 
 
+@doctor.command(name="opencode")
+def doctor_opencode():
+    """Inspect the local OpenCode integration state."""
+    from .claw_adapter import inspect_opencode_config
+
+    cs = ConfigStore()
+    if not cs.exists():
+        raise click.ClickException("No config file found. Run 'skillclaw setup' first.")
+
+    report = inspect_opencode_config(cs.to_skillclaw_config())
+    _echo_report(report)
+
+
 @skillclaw.group()
 def restore():
     """Restore agent integration state from backups."""
@@ -489,6 +502,8 @@ def restore_codex(backup_path: str | None):
         raise click.ClickException(str(exc)) from None
 
     click.echo(f"Restored Codex config: {result['target']} <- {result['source']}")
+    if result.get("removed_profile") == "True":
+        click.echo("Removed Codex SkillClaw profile config: ~/.codex/skillclaw.config.toml")
 
 
 @restore.command(name="claude")
@@ -509,6 +524,26 @@ def restore_claude(backup_path: str | None):
         raise click.ClickException(str(exc)) from None
 
     click.echo(f"Restored Claude Code settings: {result['target']} <- {result['source']}")
+
+
+@restore.command(name="opencode")
+@click.option(
+    "--backup",
+    "backup_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    default=None,
+    help="Restore from a specific backup file instead of the latest OpenCode backup.",
+)
+def restore_opencode(backup_path: str | None):
+    """Restore ~/.config/opencode/opencode.json from a saved backup."""
+    from .claw_adapter import restore_opencode_config
+
+    try:
+        result = restore_opencode_config(Path(backup_path).expanduser() if backup_path else None)
+    except FileNotFoundError as exc:
+        raise click.ClickException(str(exc)) from None
+
+    click.echo(f"Restored OpenCode config: {result['target']} <- {result['source']}")
 
 
 @skillclaw.group()
@@ -715,7 +750,10 @@ def skills():
 
 
 def _sharing_backend(cfg) -> str:
-    backend = str(getattr(cfg, "sharing_backend", "") or "").strip().lower()
+    backend = (
+        str(getattr(cfg, "sharing_skill_backend", "") or "").strip().lower()
+        or str(getattr(cfg, "sharing_backend", "") or "").strip().lower()
+    )
     if backend:
         return backend
     if getattr(cfg, "sharing_local_root", ""):
@@ -728,6 +766,15 @@ def _sharing_target(cfg) -> str:
     group = getattr(cfg, "sharing_group_id", "default")
     if backend == "local":
         return f"local storage ({cfg.sharing_local_root}/{group})"
+    if backend == "nacos":
+        server = getattr(cfg, "sharing_nacos_server", "") or (
+            getattr(cfg, "sharing_endpoint", "")
+            if str(getattr(cfg, "sharing_backend", "") or "").strip().lower() == "nacos"
+            else ""
+        )
+        namespace_id = getattr(cfg, "sharing_nacos_namespace_id", "public")
+        label = getattr(cfg, "sharing_nacos_label", "latest")
+        return f"nacos ({namespace_id}, label={label} @ {server})"
     bucket = getattr(cfg, "sharing_bucket", "")
     endpoint = getattr(cfg, "sharing_endpoint", "")
     target = f"{bucket}/{group}" if bucket else group
@@ -764,8 +811,21 @@ def _require_sharing(cs: ConfigStore):
             raise click.ClickException(
                 "OSS credentials are not configured. Set sharing.access_key_id and sharing.secret_access_key."
             )
+    elif backend == "nacos":
+        legacy_endpoint = (
+            getattr(cfg, "sharing_endpoint", "")
+            if str(getattr(cfg, "sharing_backend", "") or "").strip().lower() == "nacos"
+            else ""
+        )
+        if not (getattr(cfg, "sharing_nacos_server", "") or legacy_endpoint):
+            raise click.ClickException(
+                "Nacos skill backend is not configured. Set sharing.nacos_server first "
+                "(legacy sharing.backend=nacos may use sharing.endpoint)."
+            )
     else:
-        raise click.ClickException("Sharing backend is not configured. Set sharing.backend to local, s3, or oss.")
+        raise click.ClickException(
+            "Sharing backend is not configured. Set sharing.backend to local, s3, oss, or nacos."
+        )
     from .skill_hub import SkillHub
 
     hub = SkillHub.from_config(cfg)
@@ -800,7 +860,28 @@ def skills_push(no_filter):
         f"Done: {result['uploaded']} uploaded, "
         f"{result['skipped']} unchanged, "
         f"{result.get('filtered', 0)} filtered, "
+        f"{result.get('submitted', 0)} submitted, "
         f"{result['total_local']} total local skills."
+    )
+
+
+@skills.command(name="publish")
+@click.argument("name")
+@click.argument("version")
+@click.option(
+    "--no-update-latest",
+    is_flag=True,
+    help="Publish the version without updating the latest label.",
+)
+def skills_publish(name, version, no_update_latest):
+    """Publish an approved Nacos skill version."""
+    cs = ConfigStore()
+    cfg, hub = _require_sharing(cs)
+    if _sharing_backend(cfg) != "nacos" or not hasattr(hub, "publish_skill"):
+        raise click.ClickException("skills publish is only available when sharing.skill_backend is nacos.")
+    result = hub.publish_skill(name, version, update_latest_label=not no_update_latest)
+    click.echo(
+        f"Published {result['skill_name']} {result['version']} (updated latest: {result['updated_latest_label']})."
     )
 
 
@@ -814,9 +895,12 @@ def skills_pull():
     msg = (
         f"Done: {result['downloaded']} downloaded, "
         f"{result['skipped']} unchanged, "
+        f"{result.get('failed', 0)} failed, "
         f"{result.get('deleted', 0)} deleted, "
         f"{result['total_remote']} total remote skills."
     )
+    if result.get("failed_names"):
+        msg += f" Failed: {', '.join(result.get('failed_names', []))}"
     if result.get("restored_from_backup"):
         msg += f" Restored from backup: {result.get('backup_dir', '')}"
     click.echo(msg)

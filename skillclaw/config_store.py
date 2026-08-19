@@ -7,6 +7,7 @@ Reads/writes ~/.skillclaw/config.yaml and bridges to SkillClawConfig.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,26 @@ _DEFAULT_SKILLS_DIR = CONFIG_DIR / "skills"
 _DEFAULT_HERMES_SKILLS_DIR = Path.home() / ".hermes" / "skills"
 _DEFAULT_CODEX_SKILLS_DIR = Path.home() / ".codex" / "skills"
 _DEFAULT_CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
+_DEFAULT_OPENCODE_SKILLS_DIR = Path.home() / ".config" / "opencode" / "skills"
+_DEFAULT_LLM_API_MODE_BY_CLAW = {
+    "codex": "responses",
+}
+_FALLBACK_LLM_API_MODE = "chat"
+_NACOS_PUBLISH_MODES = {"draft", "review", "direct"}
+_SKILL_RELOAD_MODES = {"off", "poll", "callback"}
+_MIN_SKILL_RELOAD_INTERVAL_SECONDS = 5
+
+
+def _resolve_config_file(config_file: Path | None = None) -> Path:
+    if config_file is not None:
+        return Path(config_file).expanduser()
+
+    env_config_file = os.environ.get("SKILLCLAW_CONFIG_FILE", "").strip()
+    if env_config_file:
+        return Path(env_config_file).expanduser()
+
+    return CONFIG_FILE
+
 
 _DEFAULTS: dict = {
     "llm": {
@@ -64,11 +85,27 @@ _DEFAULTS: dict = {
         "region": "",
         "session_token": "",
         "local_root": "",
+        "skill_backend": "",
+        "session_backend": "",
+        "nacos_server": "",
+        "nacos_namespace_id": "public",
+        "nacos_access_token": "",
+        "nacos_username": "",
+        "nacos_password": "",
+        "nacos_label": "latest",
+        "nacos_publish_mode": "review",
         "group_id": "default",
         "user_alias": "",
         "auto_pull_on_start": False,
         "push_min_injections": 5,
         "push_min_effectiveness": 0.3,
+        "session_upload_interval": 0,
+        "skill_reload_mode": "poll",
+        "skill_reload_interval_seconds": 30,
+    },
+    "evolve": {
+        "server_url": "",
+        "proxy_reload_url": "",
     },
     "validation": {
         "enabled": False,
@@ -146,6 +183,26 @@ def _normalize_validation_mode(value: Any) -> str:
     return "replay"
 
 
+def _normalize_choice(value: Any, allowed: set[str], default: str) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in allowed else default
+
+
+def _normalize_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_reload_interval(value: Any) -> int:
+    try:
+        interval = int(value or 30)
+    except (TypeError, ValueError):
+        interval = 30
+    return max(_MIN_SKILL_RELOAD_INTERVAL_SECONDS, interval)
+
+
 def default_skills_dir_for_claw(claw_type: str) -> Path:
     """Return the default local skills directory for the selected agent."""
     normalized = str(claw_type or "").strip().lower()
@@ -155,7 +212,15 @@ def default_skills_dir_for_claw(claw_type: str) -> Path:
         return _DEFAULT_CODEX_SKILLS_DIR
     if normalized == "claude":
         return _DEFAULT_CLAUDE_SKILLS_DIR
+    if normalized == "opencode":
+        return _DEFAULT_OPENCODE_SKILLS_DIR
     return _DEFAULT_SKILLS_DIR
+
+
+def default_llm_api_mode_for_claw(claw_type: str) -> str:
+    """Return the default upstream API mode for the selected agent."""
+    normalized = str(claw_type or "").strip().lower()
+    return _DEFAULT_LLM_API_MODE_BY_CLAW.get(normalized, _FALLBACK_LLM_API_MODE)
 
 
 def resolve_skills_dir(skills_dir: Any, *, claw_type: str) -> str:
@@ -171,7 +236,7 @@ def resolve_skills_dir(skills_dir: Any, *, claw_type: str) -> str:
 
     if raw:
         expanded = Path(raw).expanduser()
-        if normalized_claw in {"hermes", "codex", "claude"} and expanded == generic_default:
+        if normalized_claw in {"hermes", "codex", "claude", "opencode"} and expanded == generic_default:
             return str(default_skills_dir_for_claw(normalized_claw))
         return str(expanded)
 
@@ -198,8 +263,8 @@ def _default_served_model_name(llm_model_id: str) -> str:
 class ConfigStore:
     """Read/write ~/.skillclaw/config.yaml."""
 
-    def __init__(self, config_file: Path = CONFIG_FILE):
-        self.config_file = config_file
+    def __init__(self, config_file: Path | None = None):
+        self.config_file = _resolve_config_file(config_file)
 
     def exists(self) -> bool:
         return self.config_file.exists()
@@ -251,16 +316,20 @@ class ConfigStore:
         llm_api_base = llm.get("api_base", "")
         llm_api_key = llm.get("api_key", "")
         llm_model_id = llm.get("model_id", "")
+        raw_claw_type = str(data.get("claw_type", "openclaw") or "openclaw")
+        default_api_mode = default_llm_api_mode_for_claw(raw_claw_type)
+        llm_api_mode = str(llm.get("api_mode", default_api_mode) or default_api_mode)
         proxy = data.get("proxy", {})
         skills = data.get("skills", {})
+        record = data.get("record", {})
         orouter = data.get("openrouter", {})
         prm = data.get("prm", {})
         configure_openclaw = bool(data.get("configure_openclaw", True))
-        raw_claw_type = str(data.get("claw_type", "openclaw") or "openclaw")
         if not configure_openclaw:
             raw_claw_type = "none"
 
         sharing = data.get("sharing", {})
+        evolve = data.get("evolve", {})
         validation = data.get("validation", {})
         dashboard = data.get("dashboard", {})
         sharing_backend = _infer_sharing_backend(sharing)
@@ -271,6 +340,12 @@ class ConfigStore:
         sharing_region = _first_non_empty(sharing, "region")
         sharing_session_token = _first_non_empty(sharing, "session_token")
         sharing_local_root = _first_non_empty(sharing, "local_root")
+        sharing_skill_backend = _first_non_empty(sharing, "skill_backend")
+        sharing_session_backend = _first_non_empty(sharing, "session_backend")
+        effective_skill_backend = sharing_skill_backend or sharing_backend
+        nacos_server = str(sharing.get("nacos_server", "") or "")
+        if not nacos_server and sharing_backend == "nacos" and effective_skill_backend == "nacos":
+            nacos_server = sharing_endpoint
 
         prm_provider = prm.get("provider", "openai")
         prm_url = str(prm.get("url", "") or llm_api_base)
@@ -288,7 +363,9 @@ class ConfigStore:
             llm_api_base=llm_api_base,
             llm_api_key=llm_api_key,
             llm_model_id=llm_model_id,
+            llm_api_mode=llm_api_mode,
             bedrock_region=llm.get("bedrock_region") or data.get("bedrock_region", "us-east-1"),
+            llm_region=str(llm.get("region", "") or ""),
             # OpenRouter
             openrouter_app_name=orouter.get("app_name", "SkillClaw"),
             openrouter_app_url=orouter.get("app_url", ""),
@@ -299,6 +376,8 @@ class ConfigStore:
             proxy_port=proxy.get("port", 30000),
             proxy_host=proxy.get("host", "0.0.0.0"),
             proxy_api_key=str(proxy.get("api_key", "") or ""),
+            record_enabled=bool(record.get("enabled", True)),
+            record_dir=str(record.get("dir", "records/") or "records/"),
             served_model_name=(
                 _first_non_empty(proxy, "served_model_name") or _default_served_model_name(llm_model_id)
             ),
@@ -330,11 +409,42 @@ class ConfigStore:
             sharing_region=sharing_region,
             sharing_session_token=sharing_session_token,
             sharing_local_root=sharing_local_root,
+            sharing_skill_backend=sharing_skill_backend,
+            sharing_session_backend=sharing_session_backend,
+            sharing_nacos_server=nacos_server,
+            sharing_nacos_namespace_id=str(
+                sharing.get("nacos_namespace_id", "") or sharing.get("namespace_id", "") or "public"
+            ),
+            sharing_nacos_access_token=str(
+                sharing.get("nacos_access_token", "") or sharing.get("access_token", "") or ""
+            ),
+            sharing_nacos_username=str(sharing.get("nacos_username", "") or sharing.get("username", "") or ""),
+            sharing_nacos_password=str(sharing.get("nacos_password", "") or sharing.get("password", "") or ""),
+            sharing_nacos_label=str(sharing.get("nacos_label", "") or sharing.get("label", "") or "latest"),
+            sharing_nacos_publish_mode=_normalize_choice(
+                sharing.get("nacos_publish_mode", "review"),
+                _NACOS_PUBLISH_MODES,
+                "review",
+            ),
             sharing_group_id=str(sharing.get("group_id", "default") or "default"),
             sharing_user_alias=str(sharing.get("user_alias", "") or ""),
             sharing_auto_pull_on_start=bool(sharing.get("auto_pull_on_start", False)),
             sharing_push_min_injections=int(sharing.get("push_min_injections", 5)),
             sharing_push_min_effectiveness=float(sharing.get("push_min_effectiveness", 0.3)),
+            sharing_session_upload_interval=_normalize_non_negative_int(
+                sharing.get("session_upload_interval", 0),
+                default=0,
+            ),
+            sharing_skill_reload_mode=_normalize_choice(
+                sharing.get("skill_reload_mode", "poll"),
+                _SKILL_RELOAD_MODES,
+                "poll",
+            ),
+            sharing_skill_reload_interval_seconds=_normalize_reload_interval(
+                sharing.get("skill_reload_interval_seconds", 30),
+            ),
+            evolve_server_url=str(evolve.get("server_url", "") or ""),
+            evolve_proxy_reload_url=str(evolve.get("proxy_reload_url", "") or ""),
             validation_enabled=bool(validation.get("enabled", False)),
             validation_mode=_normalize_validation_mode(validation.get("mode", "replay")),
             validation_idle_after_seconds=int(validation.get("idle_after_seconds", 300)),
@@ -358,6 +468,7 @@ class ConfigStore:
         llm = data.get("llm", {})
         skills = data.get("skills", {})
         prm = data.get("prm", {})
+        evolve = data.get("evolve", {})
         dashboard = data.get("dashboard", {})
         claw_type = str(data.get("claw_type", "openclaw") or "openclaw")
         effective_skills_dir = resolve_skills_dir(
@@ -392,27 +503,52 @@ class ConfigStore:
         validation = data.get("validation", {})
         if sharing.get("enabled"):
             backend = _infer_sharing_backend(sharing) or "unknown"
+            skill_backend = str(sharing.get("skill_backend", "") or "").strip().lower()
+            effective_skill_backend = skill_backend or backend
             lines += [
                 "sharing.enabled: True",
                 f"sharing.backend: {backend}",
             ]
+            if skill_backend:
+                lines.append(f"sharing.skill_backend: {skill_backend}")
             if backend == "local":
                 lines += [
                     f"sharing.local_root: {sharing.get('local_root', '?')}",
                 ]
-            else:
+            elif backend in {"s3", "oss"}:
                 lines += [
                     f"sharing.bucket:  {_first_non_empty(sharing, 'bucket', default='?')}",
                     f"sharing.endpoint: {_first_non_empty(sharing, 'endpoint', default='(default)')}",
+                ]
+            if effective_skill_backend == "nacos":
+                nacos_server = sharing.get("nacos_server") or (sharing.get("endpoint") if backend == "nacos" else "?")
+                lines += [
+                    f"sharing.nacos_server: {nacos_server}",
+                    "sharing.nacos_namespace: "
+                    f"{sharing.get('nacos_namespace_id') or sharing.get('namespace_id', 'public')}",
+                    f"sharing.nacos_label: {sharing.get('nacos_label') or sharing.get('label', 'latest')}",
+                    "sharing.nacos_publish_mode: "
+                    f"{_normalize_choice(sharing.get('nacos_publish_mode', 'review'), _NACOS_PUBLISH_MODES, 'review')}",
+                    "sharing.nacos_lifecycle: upload -> submit; review/publish policy is controlled by Nacos",
+                    "sharing.session_backend: "
+                    f"{sharing.get('session_backend') or ('local' if sharing.get('local_root') else 'not configured')}",
                 ]
             lines += [
                 f"sharing.group:   {sharing.get('group_id', 'default')}",
                 f"sharing.alias:   {sharing.get('user_alias', '?')}",
                 f"sharing.auto_pull: {sharing.get('auto_pull_on_start', False)}",
+                "sharing.session_upload_interval: "
+                f"{_normalize_non_negative_int(sharing.get('session_upload_interval', 0), default=0)}",
+                "sharing.skill_reload_mode: "
+                f"{_normalize_choice(sharing.get('skill_reload_mode', 'poll'), _SKILL_RELOAD_MODES, 'poll')}",
+                "sharing.skill_reload_interval: "
+                f"{_normalize_reload_interval(sharing.get('skill_reload_interval_seconds', 30))}",
             ]
         else:
             lines.append("sharing.enabled: False")
         lines += [
+            f"evolve.server_url: {evolve.get('server_url', '') or '(not set)'}",
+            f"evolve.proxy_reload_url: {evolve.get('proxy_reload_url', '') or '(not set)'}",
             f"validation.enabled: {validation.get('enabled', False)}",
             f"validation.mode: {_normalize_validation_mode(validation.get('mode', 'replay'))}",
             f"validation.idle_after: {validation.get('idle_after_seconds', 300)}",

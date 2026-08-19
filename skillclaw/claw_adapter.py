@@ -4,8 +4,9 @@ Claw adapter: auto-configures the active CLI agent to use the SkillClaw proxy.
 
 Supported agents:
   openclaw  — runs `openclaw config set …` + `openclaw gateway restart`
+  opencode  — patches ~/.config/opencode/opencode.json to register SkillClaw provider
   hermes    — patches ~/.hermes/config.yaml to point model traffic at SkillClaw
-  codex     — patches ~/.codex/config.toml to register SkillClaw as a provider
+  codex     — patches ~/.codex/config.toml to register an opt-in SkillClaw profile
   claude    — patches ~/.claude/settings.json to route Anthropic traffic via SkillClaw
   qwenpaw   — patches QwenPaw model config, selects SkillClaw as active model
   ironclaw  — patches ~/.ironclaw/.env, runs `ironclaw service restart`
@@ -44,12 +45,17 @@ _HERMES_SKILLS_DIR = _HERMES_HOME / "skills"
 _HERMES_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "hermes"
 _CODEX_HOME = Path.home() / ".codex"
 _CODEX_CONFIG_PATH = _CODEX_HOME / "config.toml"
+_CODEX_PROFILE_CONFIG_PATH = _CODEX_HOME / "skillclaw.config.toml"
 _CODEX_SKILLS_DIR = _CODEX_HOME / "skills"
 _CODEX_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "codex"
 _CLAUDE_HOME = Path.home() / ".claude"
 _CLAUDE_SETTINGS_PATH = _CLAUDE_HOME / "settings.json"
 _CLAUDE_SKILLS_DIR = _CLAUDE_HOME / "skills"
 _CLAUDE_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "claude"
+_OPENCODE_CONFIG_DIR = Path.home() / ".config" / "opencode"
+_OPENCODE_CONFIG_PATH = _OPENCODE_CONFIG_DIR / "opencode.json"
+_OPENCODE_SKILLS_DIR = _OPENCODE_CONFIG_DIR / "skills"
+_OPENCODE_BACKUP_DIR = Path.home() / ".skillclaw" / "backups" / "opencode"
 
 
 # ------------------------------------------------------------------ #
@@ -321,6 +327,30 @@ def _upsert_top_level_toml_keys(text: str, updates: dict[str, object]) -> str:
 
     merged = updated_preamble + remainder
     return "\n".join(merged).rstrip() + "\n"
+
+
+def _remove_top_level_toml_keys(text: str, keys: set[str]) -> str:
+    """Remove selected top-level assignments before the first TOML table."""
+    lines = text.splitlines()
+    first_table_index = len(lines)
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            first_table_index = idx
+            break
+
+    preamble = lines[:first_table_index]
+    remainder = lines[first_table_index:]
+    kept: list[str] = []
+    for line in preamble:
+        stripped = line.strip()
+        if stripped.startswith("#") or "=" not in stripped:
+            kept.append(line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key not in keys:
+            kept.append(line)
+    return "\n".join(kept + remainder).rstrip() + "\n"
 
 
 def _remove_toml_table(text: str, table_name: str) -> str:
@@ -625,12 +655,25 @@ def _build_codex_provider_block(base_url: str, api_key: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _build_codex_profile_block(model_id: str) -> str:
+    lines = [
+        f"model = {_format_toml_value(model_id)}",
+        'model_provider = "skillclaw"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _configure_codex(cfg: "SkillClawConfig") -> None:
-    """Auto-configure Codex CLI to use the SkillClaw proxy."""
+    """Register SkillClaw as an opt-in Codex profile.
+
+    Do not change Codex's global ``model`` / ``model_provider`` defaults.
+    Users opt in explicitly with ``codex --profile skillclaw``.
+    """
     model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
     api_key = cfg.proxy_api_key or "skillclaw"
     base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
     config_path = _CODEX_CONFIG_PATH
+    profile_config_path = _CODEX_PROFILE_CONFIG_PATH
     _prepare_external_skills_dir(_CODEX_SKILLS_DIR, "Codex")
 
     existing_text = ""
@@ -640,23 +683,22 @@ def _configure_codex(cfg: "SkillClawConfig") -> None:
         except Exception as e:
             logger.warning("[ClawAdapter] Failed to read Codex config %s: %s", config_path, e)
 
-    updated = _upsert_top_level_toml_keys(
-        existing_text,
-        {
-            "model": model_id,
-            "model_provider": "skillclaw",
-        },
-    )
+    updated = existing_text
+    if str(_extract_top_level_toml_value(updated, "model_provider") or "") == "skillclaw":
+        updated = _remove_top_level_toml_keys(updated, {"model", "model_provider"})
     updated = _remove_toml_table(updated, "model_providers.skillclaw").rstrip() + "\n\n"
-    updated += _build_codex_provider_block(base_url, api_key)
+    updated = _remove_toml_table(updated, "profiles.skillclaw").rstrip() + "\n\n"
+    profile_text = _build_codex_profile_block(model_id) + "\n" + _build_codex_provider_block(base_url, api_key)
 
     _backup_codex_config_if_changed(config_path, updated)
     _write_text_atomic(config_path, updated, "Codex config")
+    _write_text_atomic(profile_config_path, profile_text, "Codex SkillClaw profile config")
 
 
 def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
     """Return a diagnostic snapshot of the local Codex integration state."""
     config_path = _CODEX_CONFIG_PATH
+    profile_config_path = _CODEX_PROFILE_CONFIG_PATH
     expected_model = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
     expected_base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
     expected_api_key = cfg.proxy_api_key or "skillclaw"
@@ -671,17 +713,25 @@ def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
             text = config_path.read_text(encoding="utf-8")
         except Exception as e:
             logger.warning("[ClawAdapter] Failed to read Codex config %s: %s", config_path, e)
+    profile_text = ""
+    if profile_config_path.exists():
+        try:
+            profile_text = profile_config_path.read_text(encoding="utf-8")
+        except Exception as e:
+            logger.warning("[ClawAdapter] Failed to read Codex profile config %s: %s", profile_config_path, e)
 
     configured_model = str(_extract_top_level_toml_value(text, "model") or "")
     configured_provider = str(_extract_top_level_toml_value(text, "model_provider") or "")
-    provider_cfg = _extract_toml_table(text, "model_providers.skillclaw")
+    provider_cfg = _extract_toml_table(profile_text, "model_providers.skillclaw")
     configured_base_url = str(provider_cfg.get("base_url") or "")
     configured_wire_api = str(provider_cfg.get("wire_api") or "")
     configured_token = str(provider_cfg.get("experimental_bearer_token") or "")
+    configured_profile_model = str(_extract_top_level_toml_value(profile_text, "model") or "")
+    configured_profile_provider = str(_extract_top_level_toml_value(profile_text, "model_provider") or "")
 
     proxy_match = (
-        configured_model == expected_model
-        and configured_provider == "skillclaw"
+        configured_profile_model == expected_model
+        and configured_profile_provider == "skillclaw"
         and configured_base_url == expected_base_url
         and configured_wire_api == "responses"
         and configured_token == expected_api_key
@@ -691,7 +741,8 @@ def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
     skills_dir_match = configured_skillclaw_skills_dir == expected_skills_dir
     issues: list[str] = []
     notes: list[str] = [
-        "Codex uses the OpenAI Responses-compatible SkillClaw endpoint via `model_providers.skillclaw`.",
+        "Codex can opt into SkillClaw with `codex --profile skillclaw`.",
+        "SkillClaw registers a Codex profile and does not change Codex's global model defaults.",
         "Codex session boundaries fall back to proxy-side heuristics because"
         " Codex does not send SkillClaw session headers.",
     ]
@@ -699,9 +750,16 @@ def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
 
     if not config_path.exists():
         issues.append("Codex config is missing: ~/.codex/config.toml")
+    if not profile_config_path.exists():
+        issues.append("Codex SkillClaw profile config is missing: ~/.codex/skillclaw.config.toml")
     if not proxy_match:
-        issues.append("Codex model routing is not pointing at the local SkillClaw proxy.")
-        next_steps.append("Start SkillClaw once with `claw_type=codex` so it can rewrite ~/.codex/config.toml.")
+        issues.append("Codex SkillClaw profile is missing or not pointing at the local SkillClaw proxy.")
+        next_steps.append(
+            "Start SkillClaw once with `claw_type=codex` so it can register ~/.codex/skillclaw.config.toml."
+        )
+    if configured_provider == "skillclaw":
+        issues.append("Codex global model_provider still points at SkillClaw; normal Codex runs may be intercepted.")
+        next_steps.append('Remove top-level `model_provider = "skillclaw"` or run `skillclaw restore codex`.')
     if not expected_skills_dir.is_dir():
         issues.append(f"Codex skills directory is missing: {expected_skills_dir}")
         next_steps.append(f"Create or prepare the Codex skills directory: {expected_skills_dir}")
@@ -718,9 +776,12 @@ def inspect_codex_config(cfg: "SkillClawConfig") -> dict[str, object]:
         "status": "ok" if not issues else "warning",
         "config_path": str(config_path),
         "config_exists": config_path.exists(),
-        "integration_scope": "codex-only",
+        "integration_scope": "codex-profile-only",
         "expected_model": expected_model,
         "configured_model": configured_model or "(unset)",
+        "expected_profile": "skillclaw",
+        "configured_profile_model": configured_profile_model or "(unset)",
+        "configured_profile_provider": configured_profile_provider or "(unset)",
         "expected_base_url": expected_base_url,
         "configured_base_url": configured_base_url or "(unset)",
         "configured_provider": configured_provider or "(unset)",
@@ -747,7 +808,12 @@ def restore_codex_config(backup_path: Path | None = None) -> dict[str, str]:
     text = source.read_text(encoding="utf-8")
     target = _CODEX_CONFIG_PATH
     _write_text_atomic(target, text, "Codex config restore")
-    return {"source": str(source), "target": str(target)}
+    profile_target = _CODEX_PROFILE_CONFIG_PATH
+    removed_profile = False
+    if profile_target.exists():
+        profile_target.unlink()
+        removed_profile = True
+    return {"source": str(source), "target": str(target), "removed_profile": str(removed_profile)}
 
 
 # ------------------------------------------------------------------ #
@@ -868,6 +934,164 @@ def restore_claude_config(backup_path: Path | None = None) -> dict[str, str]:
     text = source.read_text(encoding="utf-8")
     target = _CLAUDE_SETTINGS_PATH
     _write_text_atomic(target, text, "Claude Code settings restore")
+    return {"source": str(source), "target": str(target)}
+
+
+# ------------------------------------------------------------------ #
+# OpenCode adapter                                                    #
+# ------------------------------------------------------------------ #
+
+
+def _backup_opencode_config_if_changed(config_path: Path, new_text: str) -> Path | None:
+    return _backup_text_file_if_changed(
+        config_path,
+        new_text,
+        backup_dir=_OPENCODE_BACKUP_DIR,
+        backup_stem="opencode",
+        backup_suffix="json",
+        label="OpenCode config",
+    )
+
+
+def _latest_opencode_backup_path() -> Path | None:
+    return _latest_backup_path(_OPENCODE_BACKUP_DIR, "opencode", "json")
+
+
+def _prepare_opencode_skills_dir(cfg: "SkillClawConfig") -> None:
+    target_dir = Path(str(getattr(cfg, "skills_dir", "") or _OPENCODE_SKILLS_DIR)).expanduser()
+    _prepare_external_skills_dir(target_dir, "OpenCode")
+
+
+def _configure_opencode(cfg: "SkillClawConfig") -> None:
+    """Auto-configure OpenCode to use the SkillClaw proxy."""
+    config_path = _OPENCODE_CONFIG_PATH
+    model_id = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
+    api_key = cfg.proxy_api_key or "skillclaw"
+    base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
+    _prepare_opencode_skills_dir(cfg)
+
+    data = _load_json_mapping(config_path, "OpenCode")
+
+    provider_block = data.get("provider")
+    if not isinstance(provider_block, dict):
+        provider_block = {}
+        data["provider"] = provider_block
+
+    provider_block["skillclaw"] = {
+        "api": "openai-completions",
+        "name": "SkillClaw",
+        "options": {
+            "apiKey": api_key,
+            "baseURL": base_url,
+        },
+        "models": {
+            model_id: {
+                "id": model_id,
+                "name": model_id,
+                "reasoning": False,
+                "input": ["text"],
+                "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "contextWindow": 32768,
+                "maxTokens": 8192,
+            }
+        },
+    }
+
+    data["model"] = f"skillclaw/{model_id}"
+
+    new_text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    _backup_opencode_config_if_changed(config_path, new_text)
+    _write_json_mapping_atomic(config_path, data, "OpenCode")
+
+
+def inspect_opencode_config(cfg: "SkillClawConfig") -> dict[str, object]:
+    """Return a diagnostic snapshot of the local OpenCode integration state."""
+    config_path = _OPENCODE_CONFIG_PATH
+    expected_model = cfg.served_model_name or cfg.llm_model_id or "skillclaw-model"
+    expected_base_url = f"http://127.0.0.1:{cfg.proxy_port}/v1"
+    expected_skills_dir = Path(str(getattr(cfg, "skills_dir", "") or _OPENCODE_SKILLS_DIR)).expanduser()
+
+    data = _load_json_mapping(config_path, "OpenCode")
+    provider_block = data.get("provider") if isinstance(data, dict) else {}
+    if not isinstance(provider_block, dict):
+        provider_block = {}
+
+    skillclaw_block = provider_block.get("skillclaw")
+    if not isinstance(skillclaw_block, dict):
+        skillclaw_block = {}
+    skillclaw_options = skillclaw_block.get("options")
+    if not isinstance(skillclaw_options, dict):
+        skillclaw_options = {}
+
+    configured_base_url = str(skillclaw_options.get("baseURL", "") or "")
+    configured_api_key = str(skillclaw_options.get("apiKey", "") or "")
+    configured_model = str(data.get("model", "") or "")
+    configured_api = str(skillclaw_block.get("api", "") or "")
+
+    proxy_match = (
+        configured_api == "openai-completions"
+        and configured_base_url == expected_base_url
+        and configured_model == f"skillclaw/{expected_model}"
+    )
+
+    backup_path = _latest_opencode_backup_path()
+    uses_default_skills_dir = expected_skills_dir == _OPENCODE_SKILLS_DIR
+    issues: list[str] = []
+    notes: list[str] = [
+        "OpenCode uses SkillClaw through a custom provider block in ~/.config/opencode/opencode.json.",
+        "OpenCode session capture falls back to proxy-side heuristics"
+        " because OpenCode does not send explicit SkillClaw session headers.",
+    ]
+    next_steps: list[str] = []
+
+    if not config_path.exists():
+        issues.append("OpenCode config is missing: ~/.config/opencode/opencode.json")
+    if not proxy_match:
+        issues.append("OpenCode model routing is not pointing at the local SkillClaw proxy.")
+        next_steps.append(
+            "Start SkillClaw once with `claw_type=opencode` so it can rewrite ~/.config/opencode/opencode.json."
+        )
+    if not expected_skills_dir.is_dir():
+        issues.append(f"OpenCode skills directory is missing: {expected_skills_dir}")
+        next_steps.append(f"Create or prepare the OpenCode skills directory: {expected_skills_dir}")
+
+    if not backup_path:
+        next_steps.append(
+            "Run SkillClaw once before relying on `skillclaw restore opencode`, so a backup can be created."
+        )
+
+    return {
+        "status": "ok" if not issues else "warning",
+        "config_path": str(config_path),
+        "config_exists": config_path.exists(),
+        "integration_scope": "opencode-only",
+        "expected_model": expected_model,
+        "expected_base_url": expected_base_url,
+        "configured_api": configured_api or "(unset)",
+        "configured_base_url": configured_base_url or "(unset)",
+        "configured_model": configured_model or "(unset)",
+        "configured_api_key": "(obscured)" if configured_api_key else "(unset)",
+        "proxy_match": proxy_match,
+        "expected_skills_dir": str(expected_skills_dir),
+        "skills_dir_exists": expected_skills_dir.is_dir(),
+        "skills_dir_mode": "opencode-default" if uses_default_skills_dir else "custom",
+        "latest_backup": str(backup_path) if backup_path else "(none)",
+        "session_boundary_mode": "proxy heuristics",
+        "issues": issues,
+        "notes": notes,
+        "next_steps": next_steps,
+    }
+
+
+def restore_opencode_config(backup_path: Path | None = None) -> dict[str, str]:
+    """Restore ~/.config/opencode/opencode.json from the latest or a specified backup."""
+    source = Path(backup_path).expanduser() if backup_path is not None else _latest_opencode_backup_path()
+    if source is None or not source.exists():
+        raise FileNotFoundError("No OpenCode backup found")
+
+    text = source.read_text(encoding="utf-8")
+    target = _OPENCODE_CONFIG_PATH
+    _write_text_atomic(target, text, "OpenCode config restore")
     return {"source": str(source), "target": str(target)}
 
 
@@ -1426,6 +1650,7 @@ _ADAPTERS: dict[str, Callable[["SkillClawConfig"], None]] = {
     "hermes": _configure_hermes,
     "codex": _configure_codex,
     "claude": _configure_claude,
+    "opencode": _configure_opencode,
     "qwenpaw": _configure_qwenpaw,
     "ironclaw": _configure_ironclaw,
     "picoclaw": _configure_picoclaw,

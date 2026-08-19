@@ -122,6 +122,7 @@ SkillClaw 不是让 Hermes 学更多，而是让它学到的一切，真正变�
 
 ## 动态
 
+- **2026/08/06** — 我们很高兴宣布 [LongHorizon-Harness](https://github.com/AMAP-ML/LongHorizon-Harness) 正式开源！它帮助 Agent 在桌面应用和命令行中持续完成复杂的长程计算机操作任务，并通过持久化状态和可验证进展保持任务连续推进。欢迎大家关注项目、点亮 Star，并参与交流。
 - **2026/04/22** — 新增支持中英文切换的 dashboard，可通过 `skillclaw dashboard sync` 和 `skillclaw dashboard serve` 查看本地 / 共享 skill、候选验证进度、版本历史与会话追溯。
 - **2026/04/20** — 新增 [Codex](https://github.com/openai/codex) 与 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 集成，支持自动接入代理、使用各自原生 skills 目录，并提供 `doctor` / `restore` 命令。
 - **2026/04/17** — 新增 [QwenPaw](https://github.com/agentscope-ai/QwenPaw) 集成，并同步更新文档以覆盖更多 Agent 框架。
@@ -208,10 +209,12 @@ skillclaw setup
 
 设置向导会依次提示你选择 provider、模型、本地 skills 目录、PRM 设置、可选的 CLI agent 集成、以及可选的共享存储。
 
+如果你使用 Atlas Cloud 作为上游 OpenAI 兼容 provider，可以选择 `atlascloud`，保留默认 API base `https://api.atlascloud.ai/v1`，并在提示时输入你的 Atlas Cloud API key。该预设默认走 chat-compatible 转发，因此 Codex 客户端也可以通过 SkillClaw 的 Responses-to-chat 桥接使用。
+
 第一次最小化验证时，推荐这样选：
 
 - `CLI agent` 选 `none`，先不要自动改外部 agent 配置
-- `skills` 目录保持默认值 `~/.skillclaw/skills`；如果你选了 Hermes，默认技能库会变成 `~/.hermes/skills`
+- `skills` 目录保持默认值 `~/.skillclaw/skills`；如果你选了 Hermes、Codex 或 Claude Code，默认技能库会变成 `~/.hermes/skills`、`~/.codex/skills` 或 `~/.claude/skills`
 - 如果你只是想先验证代理能不能正常用，可以先关闭 shared storage
 - 如果你后面想在同一台机器上继续跑本地 evolver 闭环，就把 shared storage 打开并选 `local` backend，例如 `~/.skillclaw/local-share`
 - 如果你想先把成本压到最低，可以先关闭 PRM

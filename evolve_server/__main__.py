@@ -49,7 +49,10 @@ def _build_config_from_args(args: argparse.Namespace) -> EvolveServerConfig:
     if not config.storage_backend:
         if args.oss_endpoint or args.oss_bucket:
             config.storage_backend = "oss"
-        elif config.storage_bucket or config.storage_endpoint:
+        elif config.storage_bucket or (
+            config.storage_endpoint
+            and str(getattr(config, "skill_storage_backend", "") or "").strip().lower() != "nacos"
+        ):
             config.storage_backend = "s3"
     if args.group_id:
         config.group_id = args.group_id
@@ -63,6 +66,8 @@ def _build_config_from_args(args: argparse.Namespace) -> EvolveServerConfig:
         config.http_port = args.port
     if args.publish_mode:
         config.publish_mode = args.publish_mode
+    if args.nacos_publish_mode:
+        config.nacos_publish_mode = args.nacos_publish_mode
     if args.use_skill_verifier is not None:
         config.use_skill_verifier = args.use_skill_verifier
     if args.skill_verifier_min_score is not None:
@@ -111,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["direct", "validated"],
         default=None,
         help="Direct publish to skills/ or stage jobs for client-side validation before publish.",
+    )
+    parser.add_argument(
+        "--nacos-publish-mode",
+        choices=["draft", "review", "direct"],
+        default=None,
+        help="Nacos Skill lifecycle mode: draft only, submit for review, or publish latest directly.",
     )
     skill_verifier_group = parser.add_mutually_exclusive_group()
     skill_verifier_group.add_argument(
@@ -240,6 +251,18 @@ def main() -> None:
                     "or use --use-skillclaw-config."
                 )
                 raise SystemExit(1)
+        elif not backend:
+            if str(getattr(config, "skill_storage_backend", "") or "").strip().lower() == "nacos":
+                logger.error(
+                    "sharing.skill_backend=nacos stores skill assets only. Configure session storage with "
+                    "sharing.backend, sharing.session_backend, sharing.local_root, EVOLVE_STORAGE_*, or use --mock."
+                )
+                raise SystemExit(1)
+            logger.error(
+                "Storage backend is not configured. Set EVOLVE_STORAGE_BACKEND, use --use-skillclaw-config, "
+                "use --local-root for local mode, or use --mock."
+            )
+            raise SystemExit(1)
         else:
             if not config.storage_bucket:
                 logger.error(

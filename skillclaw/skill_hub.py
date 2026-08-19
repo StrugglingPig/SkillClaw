@@ -26,12 +26,13 @@ from typing import Any, Collection, Optional
 
 from evolve_server.core.skill_registry import SkillIDRegistry
 
-from .object_store import build_object_store, is_not_found_error
+from .object_store import build_object_store, is_not_found_error, normalize_backend
 from .skill_bundle import (
     bundle_entrypoint_bytes,
     bundle_file_records,
     bundle_has_only_entrypoint,
     bundle_tree_sha256,
+    normalize_skill_path_segment,
     read_skill_bundle_with_meta,
     write_skill_bundle,
 )
@@ -44,6 +45,8 @@ def _is_hermes_skill_root(skills_dir: str) -> bool:
 
 
 def _skill_dir_for_root(skills_dir: str, skill_name: str, category: str = "general") -> str:
+    skill_name = normalize_skill_path_segment(skill_name, "skill name")
+    category = normalize_skill_path_segment(category or "general", "skill category")
     if _is_hermes_skill_root(skills_dir) and category and category != "general":
         return os.path.join(skills_dir, category, skill_name)
     return os.path.join(skills_dir, skill_name)
@@ -91,7 +94,12 @@ class SkillHub:
 
     @classmethod
     def from_config(cls, config) -> "SkillHub":
-        backend = str(getattr(config, "sharing_backend", "") or "").strip().lower()
+        sharing_backend = str(getattr(config, "sharing_backend", "") or "").strip().lower()
+        backend = str(getattr(config, "sharing_skill_backend", "") or "").strip().lower() or sharing_backend
+        if backend == "nacos":
+            from .nacos_skill_hub import NacosSkillHub
+
+            return NacosSkillHub.from_config(config)
         endpoint = str(getattr(config, "sharing_endpoint", "") or "")
         bucket = str(getattr(config, "sharing_bucket", "") or "")
         access_key_id = str(getattr(config, "sharing_access_key_id", "") or "")
@@ -99,6 +107,51 @@ class SkillHub:
         local_root = str(getattr(config, "sharing_local_root", "") or "")
         return cls(
             backend=backend or ("local" if local_root else "s3" if (bucket or endpoint) else "oss"),
+            endpoint=endpoint,
+            bucket=bucket,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            region=str(getattr(config, "sharing_region", "") or ""),
+            session_token=str(getattr(config, "sharing_session_token", "") or ""),
+            local_root=local_root,
+            group_id=getattr(config, "sharing_group_id", "default"),
+            user_alias=getattr(config, "sharing_user_alias", ""),
+        )
+
+    @classmethod
+    def object_storage_from_config(cls, config) -> Optional["SkillHub"]:
+        """Build the legacy object-store hub for non-skill artifacts.
+
+        ``sharing.skill_backend=nacos`` selects only the Skill registry.
+        Sessions, validation jobs, and other non-skill artifacts must continue
+        to use local/OSS/S3 object storage when that storage is explicitly
+        configured.
+        """
+        sharing_backend = str(getattr(config, "sharing_backend", "") or "").strip().lower()
+        backend = str(getattr(config, "sharing_session_backend", "") or "").strip().lower()
+        if not backend and sharing_backend != "nacos":
+            backend = sharing_backend
+        if not backend and sharing_backend == "nacos" and str(getattr(config, "sharing_local_root", "") or ""):
+            backend = "local"
+
+        endpoint = str(getattr(config, "sharing_endpoint", "") or "")
+        bucket = str(getattr(config, "sharing_bucket", "") or "")
+        access_key_id = str(getattr(config, "sharing_access_key_id", "") or "")
+        secret_access_key = str(getattr(config, "sharing_secret_access_key", "") or "")
+        local_root = str(getattr(config, "sharing_local_root", "") or "")
+
+        resolved = normalize_backend(backend, endpoint=endpoint, local_root=local_root)
+        if resolved == "nacos":
+            resolved = ""
+        if not resolved and local_root:
+            resolved = "local"
+        if not resolved and sharing_backend != "nacos" and (bucket or endpoint):
+            resolved = "oss" if endpoint and "aliyuncs.com" in endpoint else "s3"
+        if not resolved:
+            return None
+
+        return cls(
+            backend=resolved,
             endpoint=endpoint,
             bucket=bucket,
             access_key_id=access_key_id,
@@ -136,11 +189,7 @@ class SkillHub:
         return self._bucket.iter_objects(prefix=prefix)
 
     def _delete_remote_bundle_extras(self, skill_name: str, keep_paths: Collection[str]) -> None:
-        keep_keys = {
-            self._skill_bundle_key(skill_name, rel_path)
-            for rel_path in keep_paths
-            if rel_path != "SKILL.md"
-        }
+        keep_keys = {self._skill_bundle_key(skill_name, rel_path) for rel_path in keep_paths if rel_path != "SKILL.md"}
         for obj in self._iter_remote_keys(self._skill_files_prefix(skill_name)):
             key = str(getattr(obj, "key", "") or "")
             if key and key not in keep_keys:

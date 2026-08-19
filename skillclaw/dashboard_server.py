@@ -51,7 +51,8 @@ def _build_skill_filter(config: SkillClawConfig, *, no_filter: bool = False) -> 
 
 
 def _sharing_backend(config: SkillClawConfig) -> str:
-    backend = str(config.sharing_backend or "").strip().lower()
+    backend = str(config.sharing_skill_backend or "").strip().lower()
+    backend = backend or str(config.sharing_backend or "").strip().lower()
     if backend:
         return backend
     if config.sharing_local_root:
@@ -65,6 +66,11 @@ def _sharing_target(config: SkillClawConfig) -> str:
     backend = _sharing_backend(config)
     if backend == "local":
         return f"local:{config.sharing_local_root}/{config.sharing_group_id}"
+    if backend == "nacos":
+        server = config.sharing_nacos_server or (
+            config.sharing_endpoint if str(config.sharing_backend or "").strip().lower() == "nacos" else ""
+        )
+        return f"nacos:{config.sharing_nacos_namespace_id}/{config.sharing_nacos_label}@{server}"
     if config.sharing_bucket:
         return f"{backend}:{config.sharing_bucket}/{config.sharing_group_id}"
     return f"{backend}:{config.sharing_group_id}"
@@ -80,6 +86,11 @@ def _require_sharing_hub(config: SkillClawConfig) -> SkillHub:
         raise ValueError("s3 sharing backend requires sharing_bucket")
     if backend == "oss" and (not config.sharing_bucket or not config.sharing_endpoint):
         raise ValueError("oss sharing backend requires sharing_bucket and sharing_endpoint")
+    if backend == "nacos" and not (
+        config.sharing_nacos_server
+        or (config.sharing_endpoint if str(config.sharing_backend or "").strip().lower() == "nacos" else "")
+    ):
+        raise ValueError("nacos skill backend requires sharing_nacos_server")
     if not backend:
         raise ValueError("sharing backend is not configured")
     return SkillHub.from_config(config)
@@ -166,13 +177,18 @@ class DashboardService:
             raise ValueError("bundle snapshot is unavailable for the selected version")
         write_skill_bundle(skill_root, bundle_files, clean=True)
 
-    def _embedded_evolve_server(self):
+    def _embedded_evolve_server(self, *, status_only: bool = False):
         from evolve_server.core.config import EvolveServerConfig
         from evolve_server.engines.workflow import EvolveServer
 
         from .validation_store import ValidationStore
 
         evolve_config = EvolveServerConfig.from_skillclaw_config(self.config)
+        if status_only and not evolve_config.llm_api_key:
+            # Building the engine initializes the OpenAI client, even though a
+            # status read only touches storage. Supply a non-secret placeholder
+            # so dashboard health does not require upstream LLM credentials.
+            evolve_config.llm_api_key = "skillclaw-status-only"
         try:
             validation_store = ValidationStore.from_config(self.config)
             if validation_store.list_jobs():
@@ -362,9 +378,7 @@ class DashboardService:
             else:
                 document = str(version_payload.get("skill_md") or version_payload.get("content") or "").strip()
                 if self._requires_full_bundle(current_bundle_record):
-                    raise ValueError(
-                        "selected version only has a SKILL.md snapshot; full bundle replay is unavailable"
-                    )
+                    raise ValueError("selected version only has a SKILL.md snapshot; full bundle replay is unavailable")
                 self._write_document_version(skill_root, document)
             label = f"共享 v{version_num}"
         else:
@@ -449,7 +463,7 @@ class DashboardService:
             try:
                 from evolve_server.storage.oss_helpers import list_session_keys
 
-                server = self._embedded_evolve_server()
+                server = self._embedded_evolve_server(status_only=True)
                 pending_keys = await server._call_storage(list_session_keys, server._bucket, server._prefix)
                 entries = server._id_registry.all_entries()
                 return {

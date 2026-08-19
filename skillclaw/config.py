@@ -32,7 +32,13 @@ class SkillClawConfig:
     skills_dir: str = "memory_data/skills"
     skills_public_root: str = ""
     retrieval_mode: str = "template"
+    # Embedding configuration: "local" for SentenceTransformer, "api" for OpenAI-compatible APIs
+    embedding_type: str = "local"
     embedding_model_path: str = "Qwen/Qwen3-Embedding-0.6B"
+    # OpenAI-compatible embedding API configuration
+    embedding_api_url: str = ""  # e.g., "https://api.openai.com/v1" or "https://api.jina.ai/v1"
+    embedding_api_model: str = ""  # e.g., "text-embedding-3-small" or "jina-embeddings-v5-text-small"
+    embedding_api_key: str = ""
     skill_top_k: int = 6
     max_skills_prompt_chars: int = 30000
 
@@ -62,6 +68,12 @@ class SkillClawConfig:
     llm_api_base: str = ""
     llm_api_key: str = ""
     llm_model_id: str = ""
+    # Upstream API surface: "chat" keeps the legacy chat-completions bridge;
+    # "responses" forwards Codex /v1/responses payloads to an upstream Responses API.
+    llm_api_mode: str = "chat"
+    # Optional provider region tag (e.g. "global_en" / "cn_zh") for providers that
+    # expose region-specific endpoints; otherwise empty.
+    llm_region: str = ""
 
     # ------------------------------------------------------------------ #
     # OpenRouter-specific (ignored for other providers)                    #
@@ -84,12 +96,34 @@ class SkillClawConfig:
     sharing_region: str = ""
     sharing_session_token: str = ""
     sharing_local_root: str = ""
+    # Optional override for skill assets. When empty, sharing_backend keeps its
+    # legacy behavior and is used for both skills and session artifacts.
+    sharing_skill_backend: str = ""
+    # Optional object-storage backend for non-skill artifacts when the skill
+    # backend is reserved for the Skill registry.
+    sharing_session_backend: str = ""
+    sharing_nacos_server: str = ""
+    sharing_nacos_namespace_id: str = "public"
+    sharing_nacos_access_token: str = ""
+    sharing_nacos_username: str = ""
+    sharing_nacos_password: str = ""
+    sharing_nacos_label: str = "latest"
+    sharing_nacos_publish_mode: str = "review"
 
     sharing_group_id: str = "default"
     sharing_user_alias: str = ""
     sharing_auto_pull_on_start: bool = False
     sharing_push_min_injections: int = 5
     sharing_push_min_effectiveness: float = 0.3
+    sharing_session_upload_interval: int = 0
+    sharing_skill_reload_mode: str = "poll"
+    sharing_skill_reload_interval_seconds: int = 30
+
+    # ------------------------------------------------------------------ #
+    # Evolve server integration                                           #
+    # ------------------------------------------------------------------ #
+    evolve_server_url: str = ""
+    evolve_proxy_reload_url: str = ""
 
     # ------------------------------------------------------------------ #
     # Background validation                                               #

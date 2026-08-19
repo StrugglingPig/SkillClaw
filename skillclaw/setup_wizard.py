@@ -8,7 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .claw_adapter import CLAW_TYPES
-from .config_store import CONFIG_DIR, ConfigStore, resolve_skills_dir
+from .config_store import CONFIG_DIR, ConfigStore, default_llm_api_mode_for_claw, resolve_skills_dir
 
 _PROVIDER_PRESETS = {
     "kimi": {
@@ -25,7 +25,11 @@ _PROVIDER_PRESETS = {
     },
     "minimax": {
         "api_base": "https://api.minimax.io/v1",
-        "model_id": "MiniMax-M2.7",
+        "model_id": "MiniMax-M3",
+        "regions": {
+            "global_en": "https://api.minimax.io/v1",
+            "cn_zh": "https://api.minimaxi.com/v1",
+        },
     },
     "novita": {
         "api_base": "https://api.novita.ai/openai",
@@ -35,6 +39,10 @@ _PROVIDER_PRESETS = {
         "api_base": "https://openrouter.ai/api/v1",
         "model_id": "google/gemini-2.5-pro",
     },
+    "atlascloud": {
+        "api_base": "https://api.atlascloud.ai/v1",
+        "model_id": "deepseek-ai/DeepSeek-V3.1",
+    },
     "bedrock": {
         "api_base": "",
         "model_id": "us.anthropic.claude-sonnet-4-6",
@@ -43,6 +51,10 @@ _PROVIDER_PRESETS = {
         "api_base": "",
         "model_id": "",
     },
+}
+_PROVIDER_CHOICES = ["kimi", "qwen", "openai", "minimax", "novita", "openrouter", "atlascloud", "bedrock", "custom"]
+_PROVIDER_DEFAULT_API_MODE = {
+    "atlascloud": "chat",
 }
 
 
@@ -102,6 +114,10 @@ def _infer_existing_sharing_backend(current_sharing: dict) -> str:
     return "s3"
 
 
+def _default_llm_api_mode(provider: str, claw_type: str) -> str:
+    return _PROVIDER_DEFAULT_API_MODE.get(provider, default_llm_api_mode_for_claw(claw_type))
+
+
 class SetupWizard:
     """Interactive configuration wizard."""
 
@@ -131,9 +147,10 @@ class SetupWizard:
         current_provider = current_llm.get("provider", "custom")
         provider = _prompt_choice(
             "LLM provider",
-            ["kimi", "qwen", "openai", "minimax", "novita", "openrouter", "bedrock", "custom"],
+            _PROVIDER_CHOICES,
             default=current_provider,
         )
+        provider_unchanged = current_provider == provider
         preset = _PROVIDER_PRESETS[provider]
         openrouter_config: dict = existing.get("openrouter", {})
         if provider == "bedrock":
@@ -141,25 +158,38 @@ class SetupWizard:
             api_key = ""
             model_id = _prompt(
                 "Bedrock model ID (inference profile)",
-                default=current_llm.get("model_id") or preset["model_id"],
+                default=(current_llm.get("model_id") if provider_unchanged else "") or preset["model_id"],
             )
             bedrock_region = _prompt(
                 "AWS region",
-                default=current_llm.get("bedrock_region", "us-east-1"),
+                default=(current_llm.get("bedrock_region") if provider_unchanged else "") or "us-east-1",
             )
         else:
             bedrock_region = ""
+            preset_regions = preset.get("regions") or {}
+            default_api_base = (current_llm.get("api_base") if provider_unchanged else "") or preset["api_base"]
+            if preset_regions:
+                region_choices = ["global_en", "cn_zh"]
+                default_region = str((current_llm.get("region") if provider_unchanged else "") or "global_en")
+                region = _prompt_choice(
+                    "Region",
+                    region_choices,
+                    default=default_region if default_region in region_choices else "global_en",
+                )
+                default_api_base = (current_llm.get("api_base") if provider_unchanged else "") or preset_regions[region]
+            else:
+                region = ""
             api_base = _prompt(
                 "API base URL [http://api.example.com/v1]",
-                default=current_llm.get("api_base") or preset["api_base"],
+                default=default_api_base,
             )
             model_id = _prompt(
                 "Model ID",
-                default=current_llm.get("model_id") or preset["model_id"],
+                default=(current_llm.get("model_id") if provider_unchanged else "") or preset["model_id"],
             )
             api_key = _prompt(
                 "API key",
-                default=current_llm.get("api_key", ""),
+                default=current_llm.get("api_key", "") if provider_unchanged else "",
                 hide=True,
             )
 
@@ -202,7 +232,13 @@ class SetupWizard:
                 f"Recommended directory: {default_skills_dir}"
             )
         elif claw_type == "codex":
-            print(f"Codex reads native skills from ~/.codex/skills.\nRecommended directory: {default_skills_dir}")
+            print(
+                "Codex will get a SkillClaw profile without changing its global defaults.\n"
+                "After starting SkillClaw, run: codex --profile skillclaw\n"
+                "Normal `codex` runs remain unchanged.\n"
+                "Codex reads native skills from ~/.codex/skills.\n"
+                f"Recommended directory: {default_skills_dir}"
+            )
         elif claw_type == "claude":
             print(
                 f"Claude Code reads native skills from ~/.claude/skills.\nRecommended directory: {default_skills_dir}"
@@ -280,6 +316,18 @@ class SetupWizard:
                 "user_alias": user_alias,
                 "auto_pull_on_start": auto_pull,
             }
+            for key in (
+                "skill_backend",
+                "session_backend",
+                "nacos_server",
+                "nacos_namespace_id",
+                "nacos_access_token",
+                "nacos_username",
+                "nacos_password",
+                "nacos_label",
+            ):
+                if current_sharing.get(key):
+                    sharing_config[key] = current_sharing[key]
             if sharing_backend == "local":
                 local_root = _prompt(
                     "Local shared storage root",
@@ -343,6 +391,11 @@ class SetupWizard:
         proxy_config["port"] = proxy_port
         proxy_config.setdefault("host", "0.0.0.0")
         proxy_config["served_model_name"] = served_model_name or "skillclaw-model"
+        default_api_mode = _default_llm_api_mode(provider, claw_type)
+        if provider_unchanged:
+            llm_api_mode = str(current_llm.get("api_mode", default_api_mode) or default_api_mode)
+        else:
+            llm_api_mode = default_api_mode
         data = {
             "claw_type": claw_type,
             "llm": {
@@ -351,6 +404,8 @@ class SetupWizard:
                 "api_base": api_base,
                 "api_key": api_key,
                 "bedrock_region": bedrock_region,
+                "api_mode": llm_api_mode,
+                "region": region,
             },
             "openrouter": openrouter_config,
             "proxy": proxy_config,
@@ -373,4 +428,7 @@ class SetupWizard:
 
         print(f"\nConfig saved to: {cs.config_file}")
         print("\nRun 'skillclaw start' to launch SkillClaw.")
+        if claw_type == "codex":
+            print("Then run 'codex --profile skillclaw' to use Codex through SkillClaw.")
+            print("Use 'skillclaw doctor codex' if the profile does not work as expected.")
         print("=" * 60 + "\n")

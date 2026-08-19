@@ -123,6 +123,7 @@ Everything above is what one user gets. Now scale it up: when you join a shared 
 
 ## News
 
+- **2026/08/06** — We’re excited to announce that [LongHorizon-Harness](https://github.com/AMAP-ML/LongHorizon-Harness) is now open source! It helps agents carry complex, long-horizon computer-use tasks across desktop apps and the CLI with durable state and verified progress. Welcome to follow the project, star the repository, and join the conversation.
 - **2026/04/22** — Added a bilingual dashboard with `skillclaw dashboard sync` and `skillclaw dashboard serve` for inspecting local/shared skills, validation progress, version history, and session traces.
 - **2026/04/20** — Added [Codex](https://github.com/openai/codex) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) integration with proxy auto-configuration, native skills-directory defaults, and `doctor` / `restore` commands.
 - **2026/04/17** — Added [QwenPaw](https://github.com/agentscope-ai/QwenPaw) integration and updated the docs for broader multi-agent compatibility.
@@ -209,6 +210,8 @@ skillclaw setup
 
 The setup wizard prompts for the provider, model, local skills directory, PRM settings, optional CLI agent integration, and optional shared storage.
 
+If you use Atlas Cloud as the upstream OpenAI-compatible provider, choose `atlascloud`, keep the default API base `https://api.atlascloud.ai/v1`, and enter your Atlas Cloud API key when prompted. The preset uses chat-compatible forwarding so Codex clients can use SkillClaw's Responses-to-chat bridge.
+
 For a minimal first run:
 
 - choose `none` for the CLI agent if you do not want SkillClaw to auto-configure an external agent yet
@@ -281,6 +284,17 @@ skillclaw skills pull
 ```
 
 If your team uses a mounted local shared directory instead of OSS/S3, use `sharing.backend local` plus `sharing.local_root /path/to/shared/root` instead of the remote storage keys.
+
+To store skill assets in Nacos while keeping session and validation artifacts in the existing shared storage, set a
+skill backend override:
+
+```bash
+skillclaw config sharing.backend oss
+skillclaw config sharing.skill_backend nacos
+skillclaw config sharing.nacos_server http://nacos.example.com
+```
+
+When `sharing.skill_backend` is empty, SkillClaw keeps the legacy behavior and uses `sharing.backend` for skill assets.
 
 When you join a shared group:
 
